@@ -4,7 +4,7 @@
 #include "matrix.h"
 #include "stdio.h"
 #include "math.h"
-#include <stdlib.h>
+#include "stdlib.h"
 #include <string.h>
 
 
@@ -233,6 +233,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs,
     lir = mxGetIr(plhs[0]);
     lpr = mxGetPr(plhs[0]);
     
+    
+    
     /*Step 4: Compute L*/    
     numofnz = 0;
     tmpAzj = mxCalloc(m,sizeof(double));
@@ -252,8 +254,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs,
         lir[numofnz] = j;
         lpr[numofnz] = sqrt(absval(pjj));
         numofnz = numofnz + 1;
-        if(pjj < 1e-8 ){
-            lpr[numofnz-1] = 1e-8;
+        if(pjj < 2.2e-16){
+            lpr[numofnz-1] = (threshold[j]>0)?threshold[j]:2.2e-16;
             continue;
         }
         for(i=j+1;i<n;i++)

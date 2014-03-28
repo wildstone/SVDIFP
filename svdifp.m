@@ -1,38 +1,47 @@
-function [S,V,res] = svdifp(varargin) 
+function [U,S,V,res,mvs] = svdifp(varargin) 
 %
 %   SVDIFP: Find a few smallest or largest singular values of an M-by-N matrix A
 %       with M >= N. If M < N, the transpose of A will be used for computation.
 %
-%   [S, V] = svdifp(A) returns the smallest singular value S and
-%           corresponding right singular vector V of A.
+%   S = svdifp(A) returns the smallest singular value S of A.
 %
-%   [S, V] = svdifp(A,K) returns the K smallest singular values S and
-%           corresponding right singular vectors V of A.
+%   S = svdifp(A,K) returns the K smallest singular values S of A.
 %
-%   [S, V] = svdifp(A,K,'L') returns the K largest singular values and
-%           corresponding right singular vector of A.
+%   S = svdifp(A,K,'L') returns the K largest singular values of A.
 %
-%   [S, V, res] = svdifp(...) returns residuals for corresponding singular
-%           pairs defined by res = norm(A' * A * v - sigma^2 * v).
+%   [U, S, V] = svdifp(A,...) returns the singular vectors as well
+%   If A is M-by-N and K singular values are computed, then U is M-by-K
+%   with orthonormal columns, S is K-by-K diagonal, and V is N-by-K with
+%   orthonormal columns.
+%
+%   [U, S, V, res, mvs] = svdifp(A,...) also returns residuals for corresponding singular
+%           triplets defined by res = norm([Av - u;A'u-v]) and the total
+%           number of matrix-vector multiplications during the process.
 %
 %   svdifp(A,opt), svdifp(A,K,opt), svdifp(A,K,'L',opt)
 %   take the following optional inputs defined by opt:
 %     opt.INITIALVEC:
 %       a matrix whose i-th column is the i-th initial approximate right singular
-%       vector.
+%       vector. default: []     
 %     opt.COLAMD:
 %       set to 0 to diable column approximate minimum degree permutation;
 %       default: 1.
 %     opt.TOLERANCE:
-%       termination tolerance for the 2-norm of residual;
-%       default: 10*eps*sqrt(n)*||A||^2.
+%       termination tolerance for outer iteration with residual norm([Av - u;A'u-v]);
+%       default: 1e-6 * ||A||_1.
 %     opt.MAXIT:
 %       set the maximum number of (outer) iterations; default: 1000.
 %     opt.INNERIT:
 %       set a fixed inner iteration to control the memory requirement;
 %       default: between 1 and 128 as adaptively determined.
 %     opt.USEPRECON:
-%       set to 0 to disable preconditioning; default: 1.
+%       set preconditioning off or completely on:
+%           1. set to 0 to disable preconditioning
+%           2. set to 1 to enable preconditioning by built in RIF function
+%           3. set to a matrix which is the L factor of incomplete cholesky
+%           factoization of A'A
+%           4. set to a function handle which approximate A'A^{-1}
+%        default: 1
 %     opt.SHIFT:
 %       set shift to  an approximated singular value; default: 0.
 %     opt.ADSHIFT: 
@@ -46,10 +55,10 @@ function [S,V,res] = svdifp(varargin)
 %           factorization.
 %     opt.ZRIFTHRESH:
 %       a threshold between 0 and 1 used for dropping the Z-factor in RIF;
-%           default: 10*eps*sqrt(n)*||A||^2.
+%           default: 1e-8.
 %     opt.RIFNNZ:
 %       a number between 1 and n which preallocates the nonzeros in
-%           each column of Z in RIF. default: 1000
+%           each column of Z in RIF. default: n
 %     opt.DISP:
 %       set to 0 to disable on-screen display of output, and to any other
 %       numerical value to enable display; Default: 1.
@@ -78,7 +87,7 @@ function [S,V,res] = svdifp(varargin)
 %  Neither redistribution nor commercial use is permitted without
 %  consent of the authors.
 %
-%  This version dated January 7 2014
+%  This version dated March 11 2014
 
 
 
@@ -87,41 +96,40 @@ A = varargin{1};
 
 if ~issparse(A) 
 	A = sparse(A);
-	fprintf(1, 'Warning: A is not in the sparse format.\n');             
+	fprintf(1, 'Warning: A is not in sparse format.\n');             
 end  
 
-[m,n] = size(A);
-if m < n
+[nr,nc] = size(A);
+transflag = 0; % whether the transpose of A is computed
+if nr < nc
     A = A';
-    [m,n] = size(A);
-    fprintf(1, 'Warning: m < n, left singular vector will be returned!\n');
+    transflag= 1;
+    [nr,nc] = size(A);
+    fprintf(1, 'Warning: m < n, the transpose of A will be computed!\n');
 end
 
-
-
-
 % Some default values
-k = [];
-maxsym = [];
-FindMax = 0;
-outputYes = 1;
-shift = [];
-rifthresh = 0.001;
-iterMax = 1000;
-tolerance = [];
-X = [];
-adaptiveshift = 0;
-rifnnz = 1000;
-zrifthresh = [];
-usePrecon = 1;
-mValue = 0;
-iscolamd = 1;
+k = []; % number of singular values to be computed
+maxsym = []; % 'L' if the largest singular values are desired
+FindMax = 0; % flag of finding largest singular values
+outputYes = 1; % whether output the intermediate results
+shift = []; % approximation of the desired singular value
+rifthresh = 0.001; % dropping tolerance in L
+iterMax = 1000; % number of outer iterations
+tolerance = []; % tolerance of outer iteration
+V = []; % initial approximations of desired right singular vectors
+adaptiveshift = 0; % whether apdaptive shift is enabled
+rifnnz = nc; % number of nonzeros in Z of RIF
+zrifthresh = 1e-8; % dropping tolerance in Z of RIF
+usePrecon = 1; % whether preconditioning is enabled
+mValue = 0; % dimension of Krylov subspace
+iscolamd = 1; % whether column approximate minimum degree permutation is enabled
 
 % Check Inputs: 
 if nargin > 1 
     if ~isstruct(varargin{2})
         k = varargin{2};
-        if ~isnumeric(k) || ~isscalar(k) || ~isreal(k) || (k>n) || ...
+        if ~isnumeric(k) || ~isscalar(k) || ~isreal(k) || (k>nc) || ...
                 (k<0) || ~isfinite(k)
             error('SVDIFP: Number of singulars requested, k, must be a positive integer <= n');
         end
@@ -147,20 +155,19 @@ if nargin > 1 + ~isempty(k) + ~isempty(maxsym)
     end
     
     names = fieldnames(options);   
-
-    % Check whether initial approximated right singular vectors are given
+    % Check whether initial approximate right singular vectors are given
     I = strcmpi('INITIALVEC',names);
     if any(I)
-        X = options.(names{I});
-        if size(X,1) ~= n
-            if size(X,1) == m
-                X = A' * X;
+        V = options.(names{I});
+        if size(V,1) ~= nc
+            if size(V,1) == nr
+                V = A' * V;
                 fprintf(1, 'Warning: m<n, provided initial vector will be changed to be A''*X!\n');
             else
                 error('SVDIFP: Input Error: incorrect size of initial vectors');
             end
         end
-        if size(X,2) ~= k
+        if size(V,2) ~= k
            fprintf(1,'Warning: Number of initial vectors not equal to k\n');
         end    
     end
@@ -171,8 +178,7 @@ if nargin > 1 + ~isempty(k) + ~isempty(maxsym)
         iscolamd = options.(names{I});
     end
     
-
-    % Check whether tolerance of eigifp is given
+    % Check whether tolerance of svdifp is given
     I = strcmpi('TOL',names);
     if any(I)
        tolerance = options.(names{I});
@@ -181,13 +187,13 @@ if nargin > 1 + ~isempty(k) + ~isempty(maxsym)
        end   
     end
 
-    % Check whether maxItertion of svdifp is given
+    % Check whether number of maximum outer iterations of svdifp is given
     I = strcmpi('MAXIT',names);
     if any(I)
         iterMax = options.(names{I});
     end
     
-    % Check whether  mValue is given
+    % Check whether  dimension of Krylov subspace is given
     I = strcmpi('INNERIT',names);
     if any(I)
         mValue = options.(names{I});
@@ -197,10 +203,15 @@ if nargin > 1 + ~isempty(k) + ~isempty(maxsym)
     I = strcmpi('USEPRECON',names);
 	if any(I)
         usePrecon = options.(names{I});
+        if ~isa(usePrecon,'function_handle') && ~isnumeric(usePrecon)
+           error('SVDIFP: usePrecon has to be 0,1, a matrix, or a function handle'); 
+        end
+        if isnumeric(usePrecon) && ~isscalar(usePrecon) && size(usePrecon,1) ~= nc
+            error('SVDIFP: dimension of usePrecon has to be the same as the number of columns of A');
+        end
 	end
 
-
-    % Check whether approximated singular value is given
+    % Check whether approximate singular value is given
     I = strcmpi('SHIFT',names);
     if any(I)
        shift = options.(names{I});
@@ -215,7 +226,6 @@ if nargin > 1 + ~isempty(k) + ~isempty(maxsym)
            fprintf(1,'Warning: Choosing shift adaptively, shift provided will not be used!\n'); 
         end        
     end  
-
 
     % Check whether dropping thershold of L in RIF is given
     I = strcmpi('RIFTHRESH',names);
@@ -242,285 +252,287 @@ if nargin > 1 + ~isempty(k) + ~isempty(maxsym)
     end
 end
 
-% Check whether COLAMD is disabled
-PM = eye(n,n);
-if iscolamd    
+% If COLAMD is disabled, print warning message
+PM = speye(nc,nc);
+if iscolamd     
     p = colamd(A);
     A = A(:,p);
     PM = PM(:,p);
 else 
-    fprintf('COLAMD is disabled\n');
+    fprintf(1, 'Warning: COLAMD is disabled!\n');
 end
 
-
-% Check whether k is given
+% If k is not given, set it to 1
 if isempty(k)
     k = 1;
 end
 
-% Check whether shift is given
+% If shift is not given and adaptive shift is diabled, set it to 0
 if isempty(shift) && adaptiveshift == 0
    shift = 0; 
 end
 
+% Get ||A||_1, for tolerance and deflation
+normA = norm(A,1);
 
-% estimated norm of A'A
-normata = normest(A) ^ 2; 
-
-% Check whether dropping threshold is given, if not, set it to be default
-% value
-tolerance0 = 10 * eps * normata * sqrt(n);
-if isempty(tolerance) || tolerance < tolerance0 
-    tolerance = tolerance0;
+% if tolerance is not given, set it to default value: 1e-6 * ||A||_1
+if isempty(tolerance)
+    tolerance = 1e-6 * normA;
 end
-
-% Check whether zrifthresh is given, if not, set it to be default value
-if isempty(zrifthresh)
-   zrifthresh = tolerance0; 
-end
-
 
 % Main function
-[S, V,res] = ifreesvd(A, FindMax, n,mValue,shift,rifthresh,zrifthresh,rifnnz,...
-    tolerance,iterMax,k,X,normata,outputYes,usePrecon);
+[U, S, V,res, mvs] = ifreesvd(A,normA, FindMax, mValue,shift,rifthresh,zrifthresh,rifnnz,...
+    tolerance,iterMax,k,V,outputYes,usePrecon);
 V = PM * V;
 
-
+S = diag(S);
+if nargout <= 1
+    U = S;
+else 
+    if transflag
+        tmp = U;
+        U = V;
+        V = tmp;
+    end
+end
+  
    
-    
-    
-   
-function [sv, x, r,  diff, rDiff, lam_max, res] = ...
-     parnob(C,FindMax, L, sv, x, r,  diff, rDiff,  m, tol, SVecs,  lambda_1, lambda_max)
+function [sigma, lambda, v, u, r,  diff, rDiff,  res, mvs] = ...
+     parnob(C, FindMax, L, mvs, lambda, v, r, diff, rDiff, m, tol, V_C,  lambda_1, lambda_max)
 %  
-%   generate othonormal basis V of preconditioned (by L) Krylov subspace
-%   by m steps of Arnoldi algorithm and then compute the Ritz value  
-%   and Ritz vectors 
-%   
-%   x: initial approximated right singular vector
-%   SVecs =  converged singular vectors
+%   generate orthonormal basis V of preconditioned (by L) Krylov subspace
+%   by m steps of Arnoldi algorithm and then let W be the orthonormal
+%   basis of C * V, the approximate singular triplet is extracted from
+%   W'CV   
 %
 
-% initialization and normalization 
-n = size(x,1);   
-nr = size(C,1);
-
+% initialization
+[nr,nc] = size(C);
 % deflation for converged singular vectors
-if nargin == 13
-    count = size(SVecs,2);
+if nargin == 14
+    count = size(V_C,2);
     if FindMax == 1
-        % larger singular values are shifted to 0
+        % converged largest singular values are shifted to 0
         K = speye(count);
-        K = -K;
-        C = C + C * SVecs * K * SVecs';
-    else
-        % smaller singular values are shifted to sqrt(lambda_max)
-        dims = count + nr;
-        SIGMA = diag(lambda_max - lambda_1);
-        SIGMA = sqrt(SIGMA);
-        K = speye(dims);
-        K1 = K(:,1:nr);
-        K2 = K(:,nr+1:end);
-        K2 = K2 * SIGMA;
-        C = K1 * C + K2 * SVecs';
-        nr = dims;
     end
 end
 
+% C * V = W * Bm
+V = zeros(nc,m); % basis of Krylov subspace(right search space)
+W = zeros(nr,m); % basis of C * V(left search space)
+Vr = V; % residual of columns of V as approximated eigenvectors of C' * C
+Bm = zeros(m,m); % projected matrix of C
 
+V(:,1) = v; % v should be normalized
+Vr(:,1) = r;
+W(:,1) = C * V(:,1); 
+Bm(1,1) = sqrt(W(:,1)' * W(:,1));
+W(:,1) = W(:,1) / Bm(1,1); % W(:,1) is normalized
+mvs = mvs + 2;
 
-% CV = WBm
-V = zeros(n,m);
-W = zeros(nr,m);
-Wr = V; 
-Bm = zeros(m,m);
-
-temp = x' * x;
-temp = sqrt(temp);
-V(:,1) = x / temp;
-
-W(:,1) = C*V(:,1); 
-Bm(1,1) = norm(W(:,1));
-W(:,1) = W(:,1) / Bm(1,1);
-    
-r = r / temp; 
-Wr(:,1) = r;
-
-% Loop for Lanczos iteration and Gram-Schmidt
+% Loop for Arnoldi iteration and Gram-Schmidt orthogalization
 for i = 2:m-1                
     % Apply preconditioner if given 
     if ~isempty(L)
-        if isnumeric(L)         
+        % The preconditioner is supposed to be constructed from LDL-factorization of A'A where D is a diagonal matrix of 1   
+        if isnumeric(L) 
             r = L \ r;
             r = (L') \ r;    
         else 
             r = feval(L,r); 
         end
     end
-    % generate new basis vector 
-    for k = 1:(i-1)
-        temp = V(:,k)'*r;
-        r = r - temp * V(:,k);
-    end
+    % orthogalize r with V(:,1:i-1) 
+    r = mgs(r,V(:,1:i-1)); % Modified Gram Schmidt
+%     r = r - V(:,1:i-1) * (V(:,1:i-1)' * r); % Standard Gram Schmidt   
     % reorthogonalization if m > 6 
     if( m > 6)  
-        for k = 1:(i-1)        
-            temp = V(:,k)' * r;
-            r = r - temp * V(:,k);
+        r = mgs(r,V(:,1:i-1)); 
+%         r = r - V(:,1:i-1) * (V(:,1:i-1)' * r); 
+    end
+    
+    % deflation if needed
+    if nargin == 14
+        if FindMax == 1
+            r = r - V_C * (K * (V_C' * r));
         end
     end
     
-    if norm(r) == 0 
+    % break if converged
+    tmp = sqrt(r' * r);
+    if tmp == 0 
         m = i;
         break 
     end
+    
     % normalize and save new basis vector 
-    temp = norm(r);
-    V(:,i) = r;
-    V(:,i) = V(:,i) / temp;
-    if (isa(C,'function_handle'))
-        r = feval(C, V(:,i))-sv^2 * V(:,i);
-    else
-        W(:,i) = C * V(:,i);
-        r = C' * W(:,i) - sv^2 * V(:,i);
-    end
+    V(:,i) = r / tmp;
+    W(:,i) = C * V(:,i);
+    r = C' * W(:,i) - lambda * V(:,i);    
     
     % orthogonalize W(:,i)
-    for k = 1:(i-1)
-        Bm(k,i) = W(:,k)' * W(:,i);
-        W(:,i) = W(:,i) - Bm(k,i) * W(:,k);
-    end
+    [W(:,i),Bm(1:i-1,i)] = mgs(W(:,i),W(:,1:i-1)); % Modified Gram Schmidt 
+%     Bm(1:i-1,i) = W(:,1:i-1)' * W(:,i);
+%     W(:,i) = W(:,i) - W(:,1:i-1) * Bm(1:i-1,i);
     % reorthogonalization if m > 6 
     if m > 6  
-        for k = 1:(i-1),        
-            temp = W(:,k)' * W(:,i);
-            W(:,i) = W(:,i) - temp * W(:,k);
-        end
+        [W(:,i),tmp] = mgs(W(:,i),W(:,1:i-1)); % Modified Gram Schmidt
+%         W(:,i) = W(:,i) - W(:,1:i-1) * (W(:,1:i-1)' * W(:,i));
     end
-    Bm(i,i) = norm(W(:,i));
-    W(:,i) = W(:,i) / Bm(i,i);    
-    Wr(:, i) = r;   
+    Bm(i,i) = sqrt(W(:,i)' * W(:,i));
+    W(:,i) = W(:,i) / Bm(i,i);
+    Vr(:, i) = r;  
 end 
 
 % add the diff vector to the basis
 % and complete the projection Bm 
 diffNorm = sqrt(diff' * diff);
-for k = 1:m-1
-    temp = V(:,k)' * diff;
-    diff = diff - temp * V(:,k);
-    rDiff = rDiff - temp * Wr(:,k);
-end
+[diff,tmp] = mgs(diff,V(:,1:m-1));% Modified Gram Schmidt
+rDiff = rDiff - Vr(:,1:m-1) * tmp;
+% diff = diff - V(:,1:m-1) * (V(:,1:m-1)' * diff);
+% rDiff = rDiff - Vr(:,1:m-1) * (V(:,1:m-1)' * diff);
 
 % reorthogonalization if m > 6
 if m > 6
-    for k = 1:m-1
-        temp = V(:,k)' * diff;
-        diff = diff - temp * V(:,k);
-        rDiff = rDiff - temp * Wr(:,k);
-    end
+    [diff,tmp] = mgs(diff,V(:,1:m-1));% Modified Gram Schmidt
+    rDiff = rDiff - Vr(:,1:m-1) * tmp; 
+%     diff = diff - V(:,1:m-1) * (V(:,1:m-1)' * diff);
+%     rDiff = rDiff - Vr(:,1:m-1) * (V(:,1:m-1)' * diff);
 end 
 
-temp = norm(diff);
+% deflation if needed
+if nargin == 14
+    if FindMax == 1
+        rDiff = rDiff - lambda * diff;
+    end
+end
 
+tmp = sqrt(diff' * diff);
 % check and add diff only if it's significant
-if temp <= 1e-8 * diffNorm || temp == 0 
-        m = m-1;
-elseif temp <= 1e-2*diffNorm
-    % recompute (A-lambda)diff if necessary
-    V(:,m) = diff / temp;
+if tmp <= 1e-8 * diffNorm
+        m = m-1; % diff is insignificant
+elseif tmp <= 1e-2 * diffNorm
+    % recompute residual of diff i.e. C' * C * diff - sigma ^ 2 * diff if necessary
+    V(:,m) = diff / tmp;
     diff = V(:,m); 
-    if isa(C,'function_handle')
-        rDiff = feval(C, V(:,m)) - sv^2 * diff;
-    else
-        W(:,m) = C*V(:,m);
-        rDiff = C' * W(:,m) - sv^2 * diff;
-    end    
-    Wr(:,m) = rDiff;    
+    W(:,m) = C * V(:,m);
+    rDiff = C' * W(:,m) - lambda * diff;     
+    Vr(:,m) = rDiff;    
     
     % orthogonalize W(:,m)
-    for k = 1:(m-1)
-        Bm(k,m) = W(:,k)' * W(:,m);
-        W(:,m) = W(:,m) - Bm(k,m) * W(:,k);
-    end
+    [W(:,m),Bm(1:m-1,m)] = mgs(W(:,m),W(:,1:m-1)); % Modified Gram Schmidt
+%     Bm(1:m-1,m) = W(:,1:m-1)' * W(:,m);
+%     W(:,m) = W(:,m) - W(:,1:m-1) * Bm(1:m-1,m);
+        
     % reorthogonalization if m > 6 
     if m > 6 
-        for k = 1:(m-1),        
-            temp = W(:,k)' * W(:,m);
-            W(:,m) = W(:,m) - temp * W(:,k);
-        end
+        [W(:,m),tmp] = mgs(W(:,m),W(:,1:m-1));
+%         W(:,m) = W(:,m) - W(:,1:m-1) * (W(:,1:m-1)' * W(:,m));
     end
-    Bm(m,m) = norm(W(:,m));
-    W(:,m) = W(:,m) / Bm(m,m);     
+    Bm(m,m) = sqrt(W(:,m)'*W(:,m));    
+    W(:,m) = W(:,m) / Bm(m,m);
 else     
-    V(:,m) = diff / temp; 
-    Wr(:,m) = rDiff / temp;
-    r = Wr(:,m);
-
+    V(:,m) = diff / tmp; 
+    Vr(:,m) = rDiff / tmp;
+    
     % orthogonalize W(:,m)
     W(:,m) = C * V(:,m);
-    for k = 1:(m-1)
-        Bm(k,m) = W(:,k)' * W(:,m);
-        W(:,m) = W(:,m) - Bm(k,m) * W(:,k);
-    end
+    [W(:,m),Bm(1:m-1,m)] = mgs(W(:,m),W(:,1:m-1)); % Modified Gram Schmidt
+%     Bm(1:m-1,m) = W(:,1:m-1)' * W(:,m);
+%     W(:,m) = W(:,m) - W(:,1:m-1) * Bm(1:m-1,m);
     % reorthogonalization if m > 6 
     if m > 6
-        for k = 1:(m-1),        
-            temp = W(:,k)' * W(:,m);
-            W(:,m) = W(:,m) - temp * W(:,k);
-        end
+        [W(:,m),tmp] = mgs(W(:,m),W(:,1:m-1)); % Modified Gram Schmidt
+%         W(:,m) = W(:,m) - W(:,1:m-1) * (W(:,1:m-1)' * W(:,m));
     end
-    Bm(m,m) = norm(W(:,m));
-    W(:,m) = W(:,m) / Bm(m,m);         
+    Bm(m,m) = sqrt(W(:,m)' * W(:,m));
+    W(:,m) = W(:,m) / Bm(m,m);  
 end
 
-% compute Ritz value and vector of projection
+% number of matrix-vector multiplications
+mvs = mvs + 2 * m;
 
-[~,D,U] = svd(Bm(1:m,1:m));
-[delta, Isv] = sort(diag(D));  
+% compute singular triplets of projected matrix
 
+[~,S_B,V_B] = svd(Bm(1:m,1:m)); % S_D are with decreasing order
+S_B = diag(S_B);
 if FindMax == 0
-    svidx = 1;
-else
     svidx = m;
+else
+    svidx = 1;
 end
-U(:,Isv(svidx)) = U(:,Isv(svidx)) / norm(U(:,Isv(svidx))); 
-sv = D(Isv(svidx),Isv(svidx)); 
-x = V(:,1:m) * U(:,Isv(svidx));
-r = Wr(:,1:m) * U(:,Isv(svidx));
-sigma = (x' * r) / (x' * x);
-lambda = sv^2 + sigma;
-r = r - sigma * x; 
+sigma = S_B(svidx); % approximate singular value
+v = V(:,1:m) * V_B(:,svidx); % approximate right singular vector
+u = W(:,1:m) * V_B(:, svidx);
 
-% update new diff and related vectors
-% for the next iteration   
-U(1,Isv(svidx)) = -(U(2:m,Isv(svidx))' * U(2:m,Isv(svidx))) / U(1,Isv(svidx)); 
-diff = V(:,1:m) * U(1:m,Isv(svidx));
-rDiff = Wr(:,1:m) * U(1:m,Isv(svidx)); 
-rDiff = rDiff - sigma * diff;
-res = norm(r,2);
-lam_max = lambda + delta(size(delta,1)).^2;%Upper bound     
+% normu and normv are supposed to be one
+% renormalization
+normv = sqrt(v' * v);
+normu = sqrt(u' * u);
+v = v / normv; % new approximated of right singular vector
+u = u / normu; % new approximated of left singular vector
+res = norm([C * v - sigma * u; C' * u - sigma *v]); % residual of new singular triplet
 
-if (res < tol) || (m>10)         % recompute r if necessary 
-    if (isa(C,'function_handle'))
-        r = feval(C, x);
-    else
-        r = C' * (C * x);
-    end
-    lambda = (x' * r) / (x' * x); 
-    r=r-lambda*x;
-    res=norm(r,2);  
+% get the residual of v as eigenvector of C' * C
+r = Vr(:,1:m) * V_B(:,svidx) / normv;
+tmp = sigma * sigma;
+shift = tmp - lambda;
+r = r - shift * v;
+
+% get corresponding eigenvalue of C' * C
+lambda = tmp;
+
+% update new diff and related vectors for the next iteration   
+% V_B(1,svidx) = -(V_B(2:m,svidx)' * V_B(2:m,svidx)) / V_B(1,svidx); 
+V_B(1,svidx) = V_B(1,svidx) - 1;
+diff = V(:,1:m) * V_B(1:m,svidx);
+rDiff = Vr(:,1:m) * V_B(1:m,svidx); 
+rDiff = rDiff - shift * diff;
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Update v and u to minimize [C * v-sigma * u; C' * u - sigma * v]
+if sigma > eps
+    v0 = v;
+    u0 = u;
+    v1 = C' * u0;
+    v1 = v1 / sqrt(v1' * v1);
+    u1 = C * v1;
+    u1 = u1 / sqrt(u1' * u1);
+    P = [u0 u1;v0 v1];
+    AugC = [-sigma * speye(nr) C;C' -sigma * speye(nc)];
+    T = P' * (AugC * P);
+    [V_T,~] = eig(T);
+    tmp = P * V_T(:,1);
+    tmpu = tmp(1:nr);
+    tmpv = tmp(nr+1:end);
+    res = norm([C * tmpv - sigma * tmpu; C' * tmpu - sigma * tmpv]);
+else
+    res = sqrt(r' * r);
+end
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+ % recompute r if necessary 
+if  m >= 10        
+    r = C' * (C * v);
+    lambda = (v' * r) / (v' * v); 
+    r = r - lambda * v;
+    mvs = mvs + 2;
 end
 
 % use a new diff if converged. 
-if res < tol 
-        diff = V(:,1:m) * U(:,Isv(svidx + 1 - 2 * FindMax));
+if res < tol
+    if sigma > eps
+        u = tmpu;
+        v = tmpv;
+    end
+    diff = V(:,1:m) * V_B(:,svidx - 1 + 2 * FindMax);
 end
-
-
  
-function [SVals, SVecs,Sres] = ...
-    ifreesvd(C, FindMax,n, m,shift,rifthresh,zrifthresh,rifnnz, ...
-    tol, itermax, k, X,  normA, outputYes,usePrecon)
+function [U_C, S_C, V_C,residuals, mvs] = ...
+    ifreesvd(C,normC, FindMax, m,shift,rifthresh,zrifthresh,rifnnz, ...
+    tol, itermax, k, V,  outputYes,usePrecon)
 %
 %  The main function that carries out the (outer) iteration. 
 %    
@@ -528,7 +540,11 @@ function [SVals, SVecs,Sres] = ...
 %  the target matrix and A = C' * C.
 %
 
-if ~isempty(shift) && usePrecon && FindMax == 0
+
+[nr,nc] = size(C); % Get size of C
+
+% Compute preconditioner of svdifp
+if ~isempty(shift) && isscalar(usePrecon) && usePrecon == 1 && FindMax == 0
     if shift == 0 && rifthresh == 0
         if outputYes ~= 0
             fprintf('===================================================================\n');
@@ -536,13 +552,7 @@ if ~isempty(shift) && usePrecon && FindMax == 0
             fprintf('====================================================================\n');
         end
         R = qr(C,0);
-        for i = 1:n
-            if R(i,i) < 1e-8
-                R(i,i) = 1e-8;
-                R(i,(i+1):end) = 0;
-            end
-        end
-        L = @(x) (R \ (R' \ x));
+        L = R';
         startL = 1;
         Lcomputed = 2;
     else
@@ -553,14 +563,13 @@ if ~isempty(shift) && usePrecon && FindMax == 0
         
         RIFexist = exist('RIF','file');
         if RIFexist == 3
-            tic;
-            R = RIF(C,shift,rifthresh,zrifthresh,rifnnz);
-            toc;
+            rifstart = cputime;
+            L = RIF(C,shift,rifthresh,zrifthresh,rifnnz);
+            cputime - rifstart
         else
             fprintf('Couldn''t find RIF.mexa32 or RIF.mexa64, Matlab implementation RIFLDL is used instead\n');
-            R = RIFLDL(C,shift,rifthresh,zrifthresh);
+            L = RIFLDL(C,shift,rifthresh,zrifthresh);
         end
-        L = @(x) R' \ (R \ x);
         if outputYes ~= 0
             fprintf('Done!\n');
             fprintf('====================================================================\n');
@@ -568,55 +577,75 @@ if ~isempty(shift) && usePrecon && FindMax == 0
         startL = 1;
         Lcomputed = 1;
     end
-else
+elseif isscalar(usePrecon) && usePrecon == 0
     startL = 0;
     Lcomputed = 0;
+else
+    startL = 3;
+    L = usePrecon;
+    Lcomputed = 1;
 end
 
+nnz(L)
 
 % initialization 
-conv = ones(itermax,1);
+S_C = zeros(k,1); % converged k singular values of C
+V_C = zeros(nc,k); % converged k right singular vectors of C
+U_C = zeros(nr,k); % converged k left singular vectors of C
+residuals = zeros(k,1); % residuals of converged k singular triplets
+mvs = 0; % number of matrix-vector multiplications
+
+conv = ones(itermax,1); % variables for adaptively choosing m
 rate = ones(10,1);
-Lambda_1 = zeros(k,1);
-Lambda_Max = zeros(k,1);
-SVals = zeros(k,1);
-SVecs = zeros(n,k);
-Sres = zeros(k,1);
+
+Lambda_1 = zeros(k,1); % converged k eigenvalues of C'C
+Lambda_Max = zeros(k,1); % Estimation of largest eigenvalue of C'C
+
+diff = zeros(nc,1); % Initialization of diff vector       
+rDiff = diff; % C' * C * diff - sigma ^ 2 * diff
 
 
-% set initial random vector if not given
-if ~isempty(X)
-    x = X(:,1);
-    normX = norm(x);
-    if normX == 0 || size(x,1) ~= n
-        error('IFREESVD: Input Error: Invalid input of the initial vector.');
-    end
-else
-    x = rand(n,1) - 0.5 * ones(n,1);
-    normX = norm(x);
-end 
-x = x / normX;
+initialConv = 0; % initialization of sign of lth singular triplet converges
 
-
-% loop for computing k singular values
+% loop for computing k singular triplets
 for l = 1:k
+    % initialization for each singular value iteration    
+   
+    % set initial right singular vector if not given
+    if size(V,2) >= l        
+        v = V(:,l);        
+    elseif initialConv == 1 || l == 1
+        v = rand(nc,1) - 0.5 * ones(nc,1);
+    elseif l > 1 && initialConv == 0 
+        v = diff;
+    end
+    if l > 1
+        v = v - V_C(:,1:l) * (V_C(:,1:l)' * v);
+    end
+    normv = sqrt(v' * v);
+    if normv == 0
+       error('IFREESVD: Invalid initial left singular vector'); 
+    end
     
-    % initialization for each singular value iteration
-    diff = zeros(n,1);        
-    rDiff = diff; 
-    temp = x' * x; 
-    r = C' * (C * x);
-    lambda = (x' * r) / temp;
-    sv = sqrt(lambda);    
-    r = r - lambda * x;
-    res = norm(r);
-    conv(1) = res;
+    v = v / normv; % normalize v
+    u = C * v; % initial left singular vector
+    lambda = u' * u; % rayleigh quotient of v, approximated eigenvalue of C' * C 
+    sigma = sqrt(lambda);% approximate singular value of C, norm of u
+    u = u / sigma; % normalize u    
+    res = norm([C * v - sigma * u; C' * u - sigma * v]); % residual of singular triplet
+    r = C' * (C * v) - lambda * v; % residual of u as eigenvalue of C' * C
+    mvs = mvs + 2;
+        
+    if l > 1
+        diff = zeros(nc,1); % Initialization of diff vector       
+        rDiff = diff; % C' * C * diff - sigma ^ 2 * diff
+    end
     
-    initialConv = 0; 
-    changeCounter = -itermax;
     mValue = m;
+    conv(1) = res;       
+    changeCounter = -itermax;
     if mValue < 1
-        mValue = min(n-1,2);
+        mValue = min(nc-1,2);
         if startL == 1
             mValue = 1; 
         end
@@ -625,90 +654,83 @@ for l = 1:k
     priorM = mValue; 
     priorRate = -eps;
         
-    if outputYes ~=0
+    if outputYes ~= 0
         fprintf(1,'\nComputing  %d-th Singular value of A:\n',l);
-        fprintf(1,'  Iteration\tSingular Value\tResidual(A''Ax-lambda*x)\n');
+        fprintf(1,'  Iteration\tSingular Value\tResidual(Av-sigma*u;A''u-sigma*v)\n');
         fprintf(1,'  ======================================================\n');
-        fprintf(1,'  %d\t\t%E\t%E\n',1,sv,res); 
+        fprintf(1,'  %d\t\t%E\t%E\n',1,sigma,res); 
     end
     
     % iteration for computing l-th singular value
     for iter = 2:itermax        
         % if converged, set parameters for next singular value
         if res < tol   
-            lambda_max = normA; 
             initialConv = 1;  
             break;
         end
-        projSize = mValue + 2;  
+        projSize = mValue + 2;
         % compute Ritz value and vector by Krylov projection   
-        if l>1
+        if l > 1
           % with deflation for l > 1      
           if startL == 0 
               % without preconditioning
-                    [sv, x, r,  diff, rDiff,  lambda_max, res] = ...
-              parnob(C, FindMax, [], sv, x, r,  diff, rDiff, projSize, tol,...
-                          SVecs(:,1:l-1),  Lambda_1(1:l-1), Lambda_Max(1:l-1,:));
+                    [sigma, lambda, v, u, r,  diff, rDiff, res, mvs] = ...
+              parnob(C, FindMax, [], mvs, lambda, v, r,  diff, rDiff, projSize, tol,...
+                          V_C(:,1:l-1),   Lambda_1(1:l-1), Lambda_Max(1:l-1,:));
      
           else
               % with preconditioning
-                    [sv, x, r,  diff, rDiff,  lambda_max, res] = ...
-              parnob(C, FindMax, L, sv, x, r,  diff, rDiff,  projSize, tol,...
-                          SVecs(:,1:l-1),  Lambda_1(1:l-1), Lambda_Max(1:l-1,:));
+                    [sigma, lambda, v, u, r,  diff, rDiff,  res, mvs] = ...
+              parnob(C, FindMax, L, mvs, lambda, v, r,  diff, rDiff,  projSize, tol,...
+                          V_C(:,1:l-1),   Lambda_1(1:l-1), Lambda_Max(1:l-1,:));
                    
           end           
         else
-          % no deflation if l=1. 
+          % no deflation if l = 1. 
           if ( startL == 0 )
               % without preconditioning
-                    [sv, x, r,  diff, rDiff,  lambda_max, res] = ...
-              parnob(C, FindMax, [], sv, x, r,  diff, rDiff,  projSize, tol);
-               
+                    [sigma, lambda, v, u, r,  diff, rDiff,  res, mvs] = ...
+              parnob(C, FindMax, [], mvs, lambda, v, r,  diff, rDiff,  projSize, tol);
           else
               % with preconditioning
-                    [sv, x, r,  diff, rDiff, lambda_max, res] = ...
-              parnob(C, FindMax, L, sv, x, r,  diff, rDiff,  projSize, tol);
+                    [sigma, lambda, v, u, r,  diff, rDiff,  res, mvs] = ...
+              parnob(C, FindMax, L, mvs, lambda, v, r,  diff, rDiff,  projSize, tol);
                    
           end           
         end
-        lambda = sv^2; 
-        conv(iter) = res;        
-        if (outputYes ~= 0)
-            fprintf(1,'  %d\t\t%E\t%E\n',iter,sv,res);
-        end
         
-        % update tolerance and check convergence
-        if res <= tol
-            break;
+        if (outputYes ~= 0)
+            fprintf(1,'  %d\t\t%E\t%E\n',iter,sigma,res);
         end
-
+         
+        
+        conv(iter) = res; % residual of each iteration
         % check on convergence rate and update mValue
         changeCounter = changeCounter + 1;
         if changeCounter >= 19 
             rate = [rate(2:10); aveRate(conv, iter - changeCounter + 4, iter)];
-            [mValue, priorM, priorRate, fixM] = updateM(rate,mValue,priorM,priorRate,n);
+            [mValue, priorM, priorRate, fixM] = updateM(rate,mValue,priorM,priorRate,nc);
             changeCounter = (changeCounter + fixM * itermax) * (1 - fixM);  
         elseif changeCounter >= 10 
             rate = [rate(2:10); aveRate(conv, iter - changeCounter + 4, iter)];
         end
- 
 
-        if (res <=0.01 || iter >= itermax/5) && (startL == 0) && usePrecon == 1
+        % Check whether compute preconditioner based on convergence behavior
+        if (res <= tol * 10 || iter >= itermax / 5) && (startL == 0) && usePrecon == 1 && res > tol
             startL = 1;
             Lcomputed = 1;            
-            shift = sv;
+            shift = sigma;
             if outputYes ~= 0
                 fprintf('===================================================================\n');
-                fprintf('Computing RIF of A, if it takes too long, try increaseing opt.rifthresh\n');
+                fprintf('Computing RIF of A using shift %f, if it takes too long, try increaseing opt.rifthresh\n',shift);
             end
             RIFexist = exist('RIF','file');
             if RIFexist == 3
-                R = RIF(C,shift,rifthresh,zrifthresh,rifnnz);
+                L = RIF(C,shift,rifthresh,zrifthresh,rifnnz);
             else
                 fprintf('Couldn''t find RIF.mexa32 or RIF.mexa64, Matlab implementation RIFLDL is used instead\n');
-                R = RIFLDL(C,shift,rifthresh,zrifthresh);
+                L = RIFLDL(C,shift,rifthresh,zrifthresh);
             end
-            L = @(x) R' \ (R \ x);
             if outputYes ~= 0
                 fprintf('Done!\n');
                 fprintf('====================================================================\n');
@@ -716,21 +738,21 @@ for l = 1:k
             end
         end
         
+        % check whether compute a new preconditioner based on convergence behavior
         if (((res >= sqrt(tol)) && iter >= itermax/2) || ((res >= tol * 1e2) && iter >=itermax-50))...
-                && Lcomputed <= 1 && usePrecon == 1
+                && Lcomputed <= 1 && isscalar(usePrecon) && usePrecon == 1
             Lcomputed = 2;
+            shift = sigma;
             if outputYes ~= 0
                 fprintf('===================================================================\n');
-                fprintf('ReComputing RIF of matrix A, if it takes too long, try increasing opt.rifthresh\n');
+                fprintf('ReComputing RIF of matrix A using shift %f, if it takes too long, try increasing opt.rifthresh\n',shift);
             end
-            shift = sv;
             if RIFexist == 3
-                R = RIF(C,shift,rifthresh,zrifthresh,rifnnz);
+                L = RIF(C,shift,rifthresh,zrifthresh,rifnnz);
             else
                 fprintf('Couldn''t find RIF.mexa32 or RIF.mexa64, Matlab implementation RIFLDL is used instead\n');
-                R = RIFLDL(C,shift,rifthresh,zrifthresh);
-            end
-            L = @(x) R' \ (R \ x);            
+                L = RIFLDL(C,shift,rifthresh,zrifthresh);
+            end            
             if outputYes ~= 0
                 fprintf('Done!\n');
                 fprintf('====================================================================\n');
@@ -739,105 +761,127 @@ for l = 1:k
         end
     end
 
-    % store singular values and others
-    SVals(l) = sv;
-    Lambda_1(l) = lambda;
-    Lambda_Max(l) = lambda_max;
-    temp = sqrt(x' * x);
-    SVecs(:,l) = x / temp; 
-    Sres(l) = res;
-
-    % warn if not converged                         
+    % store singular triplets
+    S_C(l) = sigma;
+    V_C(:,l) = v;
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    % check whether need to recompute left singular vector
+    if sigma < eps
+        u = rand(nr,1) - 0.5 * ones(nr,1); % initial approximate left singular vector
+        normu = sqrt(u' * u);
+        u = u / normu;
+        tmp = C' * u;
+        lambda = tmp' * tmp;
+        sigma = sqrt(lambda);
+        r = C * (C' * u) - lambda * u;   
+        res = sqrt(r' * r);        
+        diff = zeros(nr,1); % Initialization of diff vector       
+        rDiff = diff; % C' * C * diff - sigma ^ 2 * diff
+        
+        L = RIFLDL(C',shift,rifthresh,zrifthresh);
+        
+        if outputYes ~= 0
+            fprintf(1,'\nComputing  left Singular vector of A:\n');
+            fprintf(1,'  Iteration\tSingular Value\tResidual(A * A'' * u - sigma^2 * u)\n');
+            fprintf(1,'  ======================================================\n');
+            fprintf(1,'  %d\t\t%E\t%E\n',1,sigma,res); 
+        end
+        
+        for iter = 2:itermax
+            [sigma, lambda, u, ~, r,  diff, rDiff, res, mvs] = ...
+              parnob(C', 0, L, mvs, 0, u, r,  diff, rDiff, 10, tol);
+            if (outputYes ~= 0)
+                fprintf(1,'  %d\t\t%E\t%E\n',iter,sigma,res);
+            end
+            % r = C * C' * u - sigma * sigma * u
+            % if r == 0, then v as corresponding eigenvector has converged
+            if res < tol
+                break;
+            end 
+        end
+    end
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    U_C(:,l) = u;
+    v = V_C(:,l);
+    sigma = S_C(l);
+    res = norm([C * v - sigma * u; C' * u - sigma * v]);
+    residuals(l) = res;
+    
+    Lambda_1(l) = lambda; % approximations of first l eigenvalues of C' * C
+    Lambda_Max(l) = normC; % approximations of biggest eigenvalue of C' * C
+    
+    % warn if not converged      
     if res >= tol
         fprintf(1,'\n');
         fprintf(1,'Warning: Singular Value %d not converged to the tolerance within max iteration\n',l);
         fprintf(1,'         Residual = %E , the set tolerance = %E \n',res, tol);
-        fprintf(1,'         Try decreasing opt.rifthresh, increasing opt.rifnnz, opt.maxit, opt.innerit, or choose a better shift\n');
+        fprintf(1,'         Try decreasing opt.rifthresh, increasing opt.maxit, opt.innerit, or choose a better shift\n');
     end
     if outputYes ~= 0
         fprintf(1,'  ------------\n');
         fprintf(1,'  Singular Value %d converged. \n',l); 
-        fprintf(1,'Residual = %.16E , the set tolerance = %E \n',res, tol);
+        fprintf(1,'  Residual = %.16E , the set tolerance = %E \n',res, tol);
     end
-    
-    %  set next initial vector  
-    if l < size(X,2)
-        x = X(:,l+1);
-        normX = norm(x);
-        if normX == 0
-            fprintf(1,'Invalid input of initial vector.\n');
-        end
-        x = diff;
-    elseif initialConv==1 
-        x = rand(n,1)-0.5*ones(n,1);  
-    else
-        x = diff;
-    end
-    x = x - SVecs(:,1:l) * (SVecs(:,1:l)' * x);
-    normX = norm(x);
-    if normX == 0
-        if l<k 
-            error('IFREESVD: Fail to form an initial vector.');
-        end 
-        return;
-    end
-    x = x / normX;  
 end
-
-
 
 function L = RIFLDL(A,shift,rifthresh,zrifthresh)
+%
 % Robust Incomplete factorization of A'A
-
+%
 
 [~,n] = size(A); % get number of columns of A
-
-nzmax = 100000000;
-
-
-L = spalloc(n,n,nzmax);
-
+nnzmax = 10000000;
+L = spalloc(n,n,nnzmax); % preallocate space for L
 threshold = zeros(n,1);
-for j = 1:n
-   threshold(j) = rifthresh * normest(A(:,j));
-end
-
-
-
-P = zeros(n,1);
 Z = speye(n,n);
 
 for j = 1:n
-    PrevZ = Z;
-    
-    % Compute <Azj,Azj> - shift ^ 2 * <zj,zj>
-    
-    % The first column of PrevZ is current zj
-    tmpZj = PrevZ(:,1);
-    tmpZjnorm = normest(tmpZj);
-    tmpZj(abs(tmpZj) < zrifthresh * tmpZjnorm) = 0;
-    AZj = A * tmpZj; 
-    P(j) = AZj' * AZj - shift * shift * PrevZ(:,1)' * PrevZ(:,1);
-    
-    L(j,j) = sqrt(abs(P(j)));
-    if P(j) < 1e-8
-        L(j,j) = 1e-8;
-        continue;
-    end    
-    
-    % Get entries in L
-    tmpcol = A(:,j+1:n)' * AZj;
-    tmpcol = tmpcol / sqrt(P(j));
-    tmpidx = (abs(tmpcol) < threshold(j+1:n));
-    tmpcol(tmpidx) = 0;
-    L(j+1:n,j) = tmpcol;    
-    tmpcoef = tmpcol / sqrt(P(j));
-    
-    % Update columns of Z   
-    Z = PrevZ(:,2:end) - PrevZ(:,1) * tmpcoef';
+   tmp = sum(abs(A(:,j)));
+   threshold(j) = rifthresh * tmp; % dropping threshold in L
 end
 
+for j = 1:n
+    % Compute <Azj,Azj> - shift ^ 2 * <zj,zj>    
+    % The first column of PrevZ is current zj
+    tmpZj = Z(:,1);
+    tmpZjnorm = sqrt(tmpZj' * tmpZj);
+    tmpZj(abs(tmpZj) < zrifthresh * tmpZjnorm) = 0; % dropping in Zj, change to full format to increase speed?    
+    AZj = A * tmpZj; 
+    pjj = AZj' * AZj;
+    if shift
+        pjj = pjj - shift * shift * Z(:,1)' * Z(:,1);
+    end    
+    L(j,j) = sqrt(abs(pjj));
+    if L(j,j) < eps
+        if threshold(j) > 0
+            L(j,j) = threshold(j);
+        else
+            L(j,j) = eps;
+        end
+        Z = Z(:,2:end);
+        continue;
+    end        
+    % Get entries in L
+    tmpcol = A(:,j+1:n)' * AZj;
+    tmpcol = tmpcol / L(j,j);
+    tmpidx = (abs(tmpcol) < threshold(j+1:n));
+    tmpcol(tmpidx) = 0; % dropping in L
+    L(j+1:n,j) = tmpcol;
+    tmpcoef = tmpcol / L(j,j);    
+    % Update columns of Z   
+    Z = Z(:,2:end) - Z(:,1) * tmpcoef';
+end
 
+function [v,q] = mgs(v, U)
+%
+% Modified Gram-Schimidt process
+% return v = (I - UU')v and q = U' * v
+[~,n] = size(U);
+q = zeros(n,1);
+for i = 1:n
+    q(i,1) = U(:,i)' * v;
+    v = v - q(i,1) * U(:,i);
+end
 
 function rate = aveRate(conv, k, iter)
 %
@@ -854,8 +898,6 @@ xyAve = ((1:iter-k)*y) / (iter-k)-xAve*sum(y) / (iter-k);
 xAve = ((iter-k) ^ 2 - 1) / 12;
 rate = xyAve / xAve;
 
-        
-
 function [mValue, priorM, priorRate, fixM] = updateM(rate, mValue, priorM, priorRate,n)       
 %
 %  Adaptive update of mValue: inner iteration 
@@ -863,7 +905,7 @@ function [mValue, priorM, priorRate, fixM] = updateM(rate, mValue, priorM, prior
 fixM = 0;
 maxm = min(n-1, 128);
 
-                    % update m when rate stagnates  
+ % update m when rate stagnates  
 if (max(rate)-min(rate)) < 0.1*(-rate(10)) || min(rate) > 0 
     k=2;                
     % increase m by k times, 
@@ -895,7 +937,3 @@ if (max(rate)-min(rate)) < 0.1*(-rate(10)) || min(rate) > 0
         fixM = -1;  
     end
 end
-
-
-
-
