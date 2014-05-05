@@ -1,30 +1,29 @@
-/*Incomplete LDL^T factorization using Robust Incomplete Factorization*/
+/*Incomplete LDL factorization using Robust Incomplete Factorization*/
 
 #include "mex.h"
 #include "matrix.h"
-#include "stdio.h"
-#include "math.h"
-#include "stdlib.h"
-#include <string.h>
+#include <stdio.h>
+#include <math.h>
+#include <stdlib.h>
 
 
-double signfun(double x)/*sign of x*/
+double signfun(double x)
 {
-    return (x>=0) - (x<0);
+    return (x >= 0) - (x < 0);
 }
 
-double absval(double x)/*absolute value of x*/
+double absval(double x)
 {
     return x * signfun(x);
 }
 
 
-int eyeinit(size_t n, mwIndex *zcolstart, mwIndex *zcolend, 
-        mwIndex *zrow, double *zval, mwIndex gap)/*Construct identity matrix CSC*/
+int eyeinit(mwIndex n, mwIndex *zcolstart, mwIndex *zcolend, 
+        mwIndex *zrow, double *zval, mwIndex gap)
 {
     mwIndex j, next;
     
-    for(j=0;j<gap && j<n;j++)
+    for(j = 0;j < gap && j < n;j++)
     {
         if(j > 0)next = next + j + 1;
         else
@@ -35,26 +34,25 @@ int eyeinit(size_t n, mwIndex *zcolstart, mwIndex *zcolend,
         zval[next] = 1;
     }
     
-    for(j>=gap;j<n;j++)
+    for(j = gap;j < n;j++)
     {
         next = next + gap;
         zcolstart[j] = next;
         zcolend[j] = next;
         zrow[next] = j;
-        zval[next] = 1;/*preallocate positions for gap+1:n*/
+        zval[next] = 1;
     }
     return 0;
 }
 
 
-
 /*Compute Matrix Vector Multiplication*/
-int matxvec(size_t n,mwIndex *ajc,mwIndex *air,
+int matxvec(mwIndex n,mwIndex *ajc,mwIndex *air,
         double *apr,mwIndex *zcolstart,mwIndex *zcolend,
         mwIndex *zrow,double *zval,mwIndex j,double *tmpAzj)
 {
     mwIndex col,iter1,iter2,row;
-    double val;/*compute Azj*/    
+    double val;    
     for(iter1 = zcolstart[j];iter1<=zcolend[j];iter1++)
     {
         col = zrow[iter1];
@@ -68,55 +66,47 @@ int matxvec(size_t n,mwIndex *ajc,mwIndex *air,
     return 0;
 }
 
-
-
 int addspvecs(mwIndex *zcolstart,mwIndex *zcolend,mwIndex *zrow,
-        double *zval,double *sumvecval,mwIndex i,mwIndex j, double lambda,double alpha)/*add two sparse vectors zi + lambdazj*/
+        double *zval,mwIndex i,mwIndex j, double lambda,double eta2)
 {
-    mwIndex row_coli,row_colj,max;
+    mwIndex row_coli,row_colj;
     mwIndex iter_coli,iter_colj,tmpind;
     int iter;
-    double sumvecnorm = 0;
-    if(i<=j)
+    double *sumvecval, zthresh=0;
+    if(i<j)
     {
         printf("i must be greater than j\n");
-        error(1);
-    }
-    max = 0;
-    
+        return 1;
+    }    
+    sumvecval = (double *)mxCalloc(i+1,sizeof(double));    
     for(iter_coli = zcolstart[i];iter_coli<=zcolend[i];iter_coli++)
     {
         row_coli = zrow[iter_coli];
-        if(max<row_coli)max = row_coli;
         sumvecval[row_coli] = zval[iter_coli];
     }
     for(iter_colj=zcolstart[j];iter_colj<=zcolend[j];iter_colj++)
     {
         row_colj = zrow[iter_colj];
-        if(max<row_colj)max = row_colj;
         sumvecval[row_colj] += lambda * zval[iter_colj];
     }
     
-    for(iter=i;iter>=0;iter--)
-    {
-        sumvecnorm += absval(sumvecval[iter]);/*norm of resulting vector*/
-    }
-    
+    for(iter = i;iter >= 0;iter--)zthresh += absval(sumvecval[iter]);
+    zthresh = eta2 * zthresh;
     
     tmpind = zcolend[i];
     for(iter=i;iter>=0;iter--)
     {
-        if(absval(sumvecval[iter]) > alpha * sumvecnorm)
+        if(absval(sumvecval[iter]) > zthresh)
         {
             
             zrow[tmpind] = iter;
-            zval[tmpind] = sumvecval[iter];            
+            zval[tmpind] = sumvecval[iter];
             tmpind--;
         }
-        if(tmpind<=zcolend[i-1])break;
+        if(tmpind <= zcolend[i-1])break;
     }
     zcolstart[i] = tmpind + 1;
-    
+    mxFree(sumvecval);
     return 0;
 }
 
@@ -131,32 +121,27 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs,
     /*Auxillary variables*/
     double tmplij;
     mwIndex tmprowind;
-    
-    /*cputime variables*/
-    clock_t start_time,end_time;
-    double cputime;
-    
+
     /*Step 2:*/
-    size_t m, n;/*m:number of rows, n:number of columns*/
+    mwSize m, n;/*m:number of rows, n:number of columns*/
     mwSize nzmax;/*nnz of input*/
     
-    size_t rnzmax=10000000;/*rnzmax should be comparable with nzmax*/
+    mwIndex rnzmax=100000000;/*rnzmax should be comparable with nzmax*/
     
     mwIndex *ajc, *air;
     double *apr;/*CSC format of prhs[0]*/
 
-    double gamma,tao, alpha,gapinput;/* gamma is the shift, and tao is threshold*/
-    double *threshold,tmpthre;
+    double mu, eta1, eta2;/* mu is the shift, and eta1 is threshold*/
+    double *threshold;
     
     /*Step 3: */
     mwIndex *zcolstart, *zcolend, *zrow;
     double *zval;
-    mwIndex gap = 1000;
+    mwIndex gap = 5000;
     
     /*Step 4:*/
-    double pjj,pij,lambda,normAzj;
+    double pjj,pij,lambda,zji;
     double  *tmpAzj;
-    double *sumvecval;
     
     /*Output:*/    
     mwIndex *ljc, *lir;
@@ -164,9 +149,9 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs,
     /*---------------------------------------------*/
     
     /* Step 1: Check input---------*/
-    if(nrhs !=5)
+    if(nrhs != 4 && nrhs !=5)
     {
-        mexErrMsgTxt("Five Input Arguments are required");
+        mexErrMsgTxt("Four or Five Input Arguments are required");
     }
     
     if(nlhs != 1)
@@ -191,36 +176,43 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs,
        
     
     /* Get shift*/
-    gamma = mxGetScalar(prhs[1]);
+    mu = mxGetScalar(prhs[1]);
     
     /*Get threshold*/
-    tao = mxGetScalar(prhs[2]);
-    threshold = mxCalloc(n,sizeof(double));
+    eta1 = mxGetScalar(prhs[2]);
+    threshold = (double *)mxCalloc(n,sizeof(double));
     
     for(j=0;j<n;j++)
     {
         for(i=ajc[j];i<ajc[j+1];i++)threshold[j] += absval(apr[i]);
-        threshold[j] = tao * threshold[j];
+        threshold[j] = eta1 * threshold[j];
     }
     
     /*Get threshold parameter for Z*/
-    alpha = mxGetScalar(prhs[3]);
+    eta2 = mxGetScalar(prhs[3]);
     
     /* Get allocation parameter*/
-	gapinput = mxGetScalar(prhs[4]);
-	gap = (mwIndex)gapinput;
-	if(gap > n)gap = n;
+    if(nrhs == 5)
+    {
+        gap = (mwIndex)mxGetScalar(prhs[4]);
+        if(gap > n)gap = n;
+    }
     
-    rnzmax = (size_t) (gap + 1) * n;
+    if(gap * m > rnzmax)rnzmax = (mwIndex)(gap*m);
     
     /*---------------------------------------*/
     
 
     /*Step 3: Initialization of Z and L----------    */
-    zcolstart = mxCalloc(n, sizeof(mwIndex));
-    zcolend = mxCalloc(n, sizeof(mwIndex));
-    zrow = mxCalloc(rnzmax,sizeof(mwIndex));
-    zval = mxCalloc(rnzmax,sizeof(double));
+    zcolstart = (mwIndex *)mxCalloc(n, sizeof(mwIndex));
+    zcolend = (mwIndex *)mxCalloc(n, sizeof(mwIndex));
+    zrow = (mwIndex *)mxCalloc(rnzmax,sizeof(mwIndex));
+    zval = (double *)mxCalloc(rnzmax,sizeof(double));
+    
+    if(zrow == NULL || zval == NULL){
+        printf("Out of memory, please use a smaller gap value\n");
+        return;
+    }
     
     eyeinit(n, zcolstart, zcolend, zrow, zval, gap);/* Let Z be eye(n,n)*/
     
@@ -228,34 +220,34 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs,
     
     
     /* Step : Output    */
-    plhs[0] = mxCreateSparse(n,n,rnzmax,mxREAL);    
+    plhs[0] = mxCreateSparse(n,n,rnzmax,mxREAL);
+    
     ljc = mxGetJc(plhs[0]);
     lir = mxGetIr(plhs[0]);
     lpr = mxGetPr(plhs[0]);
     
     
     
-    /*Step 4: Compute L*/    
+    /*Step 4: Compute L*/
+    
     numofnz = 0;
-    tmpAzj = mxCalloc(m,sizeof(double));
-    sumvecval = mxCalloc(n,sizeof(double));
+    
     for(j=0;j<n;j++)
     {
         
         pjj = 0;
-        memset(tmpAzj, 0, m*sizeof(double));
+        tmpAzj = (double *)mxCalloc(m,sizeof(double));
         matxvec(n,ajc,air,apr,zcolstart,zcolend,zrow,zval,j,tmpAzj);
         for(k=0;k<m;k++)
-        {
             if(tmpAzj[k] != 0)pjj += tmpAzj[k] * tmpAzj[k];
-        }
-        pjj = pjj - pow(gamma,2.0) * zval[zcolend[j]];
+        pjj = pjj - mu * mu * zval[zcolend[j]];
+        
         ljc[j] = numofnz;
         lir[numofnz] = j;
         lpr[numofnz] = sqrt(absval(pjj));
         numofnz = numofnz + 1;
-        if(pjj < 2.2e-16){
-            lpr[numofnz-1] = (threshold[j]>0)?threshold[j]:2.2e-16;
+        if(pjj < 2.2e-16 ){
+            lpr[numofnz-1] = (threshold[j]>0)?threshold[j]:2.2e-16;;
             continue;
         }
         for(i=j+1;i<n;i++)
@@ -266,21 +258,24 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs,
                 tmprowind = air[k];
             	pij += apr[k] * tmpAzj[tmprowind];
             }
-            /*zij = 0*/
-            lambda = pij/pjj;
-            if(absval(pij/sqrt(pjj)) > threshold[i])
+            zji = 0;
+            for(k=zcolend[i];k>=zcolstart[i];k--)
+            {
+                if(zrow[k]==j)zji = zval[k];
+            }
+            pij -= mu * mu * zji;
+
+            lambda = pij / pjj;
+            tmplij = pij / sqrt(pjj);
+            if(absval(tmplij) > threshold[i])
             {
                 lir[numofnz] = i;
-                lpr[numofnz] = lambda * sqrt(pjj);
+                lpr[numofnz] = tmplij;
                 numofnz = numofnz + 1;
-                memset(sumvecval,0,n*sizeof(double));
-                addspvecs(zcolstart,zcolend,zrow,zval,sumvecval,i,j,-lambda,alpha);
+                addspvecs(zcolstart,zcolend,zrow,zval,i,j,-lambda,eta2);
             }
         }
-        
+        mxFree(tmpAzj);
     }
-    mxFree(tmpAzj);
-    mxFree(sumvecval);
-    mxFree(zcolstart);mxFree(zcolend);mxFree(zrow);mxFree(zval);/*free space*/
     ljc[n] = numofnz;
 }
