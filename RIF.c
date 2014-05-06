@@ -220,8 +220,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs,
     
     
     /* Step : Output    */
-    plhs[0] = mxCreateSparse(n,n,rnzmax,mxREAL);
-    
+    plhs[0] = mxCreateSparse(n,n,rnzmax,mxREAL);    
     ljc = mxGetJc(plhs[0]);
     lir = mxGetIr(plhs[0]);
     lpr = mxGetPr(plhs[0]);
