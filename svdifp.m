@@ -16,7 +16,7 @@ function [U,S,V,res,mvs,precs] = svdifp(varargin)
 %
 %   [U, S, V, res] = svdifp(A,...) also returns residuals for each singular
 %       triplet defined by 
-%         res(i) = norm([A'*A*V(:,i) - S(i,i)^2*V(:,i)]) 
+%         res(i) = norm([A'*A*V(:,i) - S(i)^2*V(:,i)]) 
 %       for i=1:K. 
 %   [U, S, V, res, mvs] = svdifp(A,...) also returns the total number of 
 %       matrix-vector multiplications during the process in mvs.
@@ -30,8 +30,8 @@ function [U,S,V,res,mvs,precs] = svdifp(varargin)
 %       set to 0 to diable column approximate minimum degree permutation;
 %       default: 1 if using preconditioning and 0 if not using preconditioning.
 %     opt.TRIPLETRES:
-%       set to 1 to use residuals defined by
-%           res(i) = norm([A*V(:,i) - S(i,i)*U(:,i);A'*U(:,i) - S(i,i)*V(:,i)]) 
+%       set to 1 to use singular value and singular vectors reiplet residuals defined by
+%           res(i) = norm([A*V(:,i) - S(i)*U(:,i);A'*U(:,i) - S(i)*V(:,i)]) 
 %       for i=1:K. default: 0
 %     opt.TOLERANCE:
 %       termination tolerance for residual res(i);
@@ -90,7 +90,7 @@ function [U,S,V,res,mvs,precs] = svdifp(varargin)
 %  (qiang.ye@uky.edu). This work was supported by NSF under Grant DMS-1317424.
 %
 %  This program is provided for research and educational use and is
-%  distributed through http://www.ms.uky.edu/~qye/software.
+%  distributed through http://www.ms.uky.edu/~qye/software and GOOGLE Code.
 %  Neither redistribution nor commercial use is permitted without
 %  consent of the authors.
 %
@@ -586,7 +586,7 @@ if isscalar(usePrecon) && usePrecon == 1 && ~isempty(shift) && FindMax == 0
             L = RIF(C,shift,rifthresh,zrifthresh,rifnnz);
         else
             fprintf('RIF.mexa32 or RIF.mexa64 not found; Matlab implementation RIFLDL is used instead\n');
-            L = RIFLDL(C,shift,rifthresh,zrifthresh);
+            L = RIFLDL(C,shift,rifthresh,zrifthresh, rifnnz);
         end
         if outputYes ~= 0
             fprintf('Done!\n');
@@ -755,7 +755,7 @@ for l = 1:k
                 L = RIF(C,shift,rifthresh,zrifthresh,rifnnz);
             else
                 fprintf('RIF.mexa32 or RIF.mexa64 not found, Matlab implementation RIFLDL is used instead\n');
-                L = RIFLDL(C,shift,rifthresh,zrifthresh);
+                L = RIFLDL(C,shift,rifthresh,zrifthresh, rifnnz);
             end
             if outputYes ~= 0
                 fprintf('Done!\n');
@@ -777,7 +777,7 @@ for l = 1:k
                 L = RIF(C,shift,rifthresh,zrifthresh,rifnnz);
             else
                 fprintf('RIF.mexa32 or RIF.mexa64 not found, Matlab implementation RIFLDL is used instead\n');
-                L = RIFLDL(C,shift,rifthresh,zrifthresh);
+                L = RIFLDL(C,shift,rifthresh,zrifthresh, rifnnz);
             end            
             if outputYes ~= 0
                 fprintf('Done!\n');
@@ -806,17 +806,17 @@ for l = 1:k
     end
 end
 
-function L = RIFLDL(A,shift,rifthresh,zrifthresh)
+function L = RIFLDL(A,shift,rifthresh,zrifthresh, rifnnz)
 %
 % Robust Incomplete factorization of A'A
 %
 
 [~,n] = size(A); % get number of columns of A
-nnzmax = min(5000*n, n*(n+1)/2);
+nnzmax = min(rifnnz*n, n*(n+1)/2);
 try
     L = spalloc(n,n,nnzmax); % preallocate space for L
 catch err
-    error('RIFLDL: Out of memory! Try using a smaller nnzmax!');
+    error('RIFLDL: Out of memory! Try to input a smaller opt.rifnnz!');
 end
 Z = speye(n,n);
 threshold = rifthresh * sum(abs(A))';
