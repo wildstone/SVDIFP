@@ -119,7 +119,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs,
     mwIndex i,j,k,numofnz;
     
     /*Auxillary variables*/
-    double tmplij;
+    double tmplij, tmpljj;
     mwIndex tmprowind;
 
     /*Step 2:*/
@@ -220,7 +220,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs,
     
     
     /* Step : Output    */
-    plhs[0] = mxCreateSparse(n,n,rnzmax,mxREAL);    
+    plhs[0] = mxCreateSparse(n,n,rnzmax,mxREAL);
+    
     ljc = mxGetJc(plhs[0]);
     lir = mxGetIr(plhs[0]);
     lpr = mxGetPr(plhs[0]);
@@ -239,14 +240,17 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs,
         matxvec(n,ajc,air,apr,zcolstart,zcolend,zrow,zval,j,tmpAzj);
         for(k=0;k<m;k++)
             if(tmpAzj[k] != 0)pjj += tmpAzj[k] * tmpAzj[k];
-        pjj = pjj - mu * mu * zval[zcolend[j]];
-        
+        if(mu != 0){
+            for(i = zcolstart[j]; i <= zcolend[j]; i++)
+                pjj -= mu * mu * zval[i] * zval[i];
+        }
         ljc[j] = numofnz;
         lir[numofnz] = j;
         lpr[numofnz] = sqrt(absval(pjj));
+        tmpljj = lpr[numofnz];
         numofnz = numofnz + 1;
-        if(pjj < 2.2e-16 ){
-            lpr[numofnz-1] = (threshold[j]>0)?threshold[j]:2.2e-16;;
+        if(tmpljj < 2.2e-16 ){
+            lpr[numofnz-1] = (threshold[j]>0)?threshold[j]:2.2e-16;
             continue;
         }
         for(i=j+1;i<n;i++)
@@ -265,7 +269,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs,
             pij -= mu * mu * zji;
 
             lambda = pij / pjj;
-            tmplij = pij / sqrt(pjj);
+            tmplij = pij / tmpljj * signfun(pjj);
             if(absval(tmplij) > threshold[i])
             {
                 lir[numofnz] = i;
